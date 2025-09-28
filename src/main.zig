@@ -2,9 +2,29 @@ const std = @import("std");
 const ripple = @import("ripple");
 
 pub fn main() !void {
-    // Prints to stderr, ignoring potential errors.
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
-    try ripple.bufferedPrint();
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var counter = try ripple.createSignal(i32, allocator, 0);
+    defer counter.dispose();
+
+    const EffectData = struct {
+        read: ripple.ReadSignal(i32),
+    };
+    var data = EffectData{ .read = counter.read };
+
+    var effect = try ripple.createEffect(allocator, struct {
+        fn run(ctx: *ripple.EffectContext) anyerror!void {
+            const payload = ctx.userData(EffectData).?;
+            const value = try payload.read.get();
+            std.debug.print("count = {}\n", .{value});
+        }
+    }.run, &data);
+    defer effect.dispose();
+
+    try counter.write.set(1);
+    try counter.write.set(2);
 }
 
 test "simple test" {

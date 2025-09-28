@@ -19,6 +19,8 @@ Reactive, WASM-first web UI framework for Zig. Bringing Leptos/Yew-style ergonom
 - 🎯 **Leptos/Yew Inspired**: Familiar ergonomics for web developers
 - 🛠️ **Comptime Powered**: Leverage Zig's compile-time capabilities
 - 🏝️ **Islands Architecture**: Server-side rendering with selective hydration
+- 🧠 **Batched Scheduler**: Microtask queue with `beginBatch` and `batch`
+- 🪄 **DOM Bindings (Alpha)**: `bindText` host bridge for WASM environments
 
 ## 🎯 Goals
 
@@ -30,7 +32,78 @@ Reactive, WASM-first web UI framework for Zig. Bringing Leptos/Yew-style ergonom
 
 ## 🚧 Status
 
-Ripple is currently in early development. This is a ground-up implementation of a reactive web framework targeting WebAssembly through Zig.
+Ripple is in early development. The first milestone ships a prototype reactive core—signals, effects, derived memos, and a microtask scheduler—plus an alpha DOM text binding ready for WASM hosts. Next up: template compilation and a full hydration pipeline.
+
+## 🚀 Quickstart
+
+Ripple exposes its core runtime from `@import("ripple")`. Here's a tiny counter you can run with `zig build run`:
+
+```zig
+const std = @import("std");
+const ripple = @import("ripple");
+
+pub fn main() !void {
+  var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+  defer arena.deinit();
+  const allocator = arena.allocator();
+
+  var counter = try ripple.createSignal(i32, allocator, 0);
+  defer counter.dispose();
+
+  const Context = struct { read: ripple.ReadSignal(i32) };
+  var ctx = Context{ .read = counter.read };
+
+  var effect = try ripple.createEffect(allocator, struct {
+    fn run(scope: *ripple.EffectContext) anyerror!void {
+      const data = scope.userData(Context).?;
+      const value = try data.read.get();
+      std.debug.print("count = {}\n", .{value});
+    }
+  }.run, &ctx);
+  defer effect.dispose();
+
+  try counter.write.set(1);
+  try counter.write.set(2);
+}
+```
+
+The counter logs `0`, `1`, and `2`—demonstrating dependency tracking, synchronous flushing, and allocator-backed cleanup.
+
+## 🧵 Batching updates
+
+Batch reactive writes and flush once at the end of the transaction:
+
+```zig
+var guard = ripple.beginBatch();
+defer guard.deinit();
+try counter.write.set(41);
+try counter.write.set(42);
+try guard.commit();
+```
+
+Use `ripple.batch` if you prefer a helper around a no-argument function.
+
+## 🌐 DOM bindings
+
+`ripple.bindText` wires a signal to a DOM node id. On WASM targets we expect the host to export `ripple_dom_set_text(node_id, ptr, len)`; on native/test builds we fall back to `std.debug.print` and injectable callbacks.
+
+```zig
+var text = try ripple.createSignal([]const u8, allocator, "hello");
+var binding = try ripple.bindText(allocator, 1, text.read);
+defer binding.dispose();
+
+try text.write.set("world");
+```
+
+For integration tests or native targets, override the host callback:
+
+```zig
+const Callbacks = ripple.DomHostCallbacks;
+ripple.setDomHostCallbacks(.{
+  .set_text = myFn,
+  .context = myCtx,
+});
+```
 
 ## 📋 Roadmap
 
@@ -54,6 +127,12 @@ zig fetch --save https://github.com/ghostkellz/ripple/archive/refs/head/main.tar
 
 ```bash
 zig build
+```
+
+## 🧪 Testing
+
+```bash
+zig build test
 ```
 
 ## 📄 License
