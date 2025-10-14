@@ -1,0 +1,14 @@
+.{
+    .name = "ripple-dashboard",
+    .version = "0.1.0",
+    .dependencies = .{
+        .ripple = .{
+            .path = "../..",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ripple Counter - WASM Example</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 20px;
+        }
+
+        .container {
+            background: white;
+            border-radius: 20px;
+            padding: 60px 80px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            text-align: center;
+            max-width: 500px;
+            width: 100%;
+        }
+
+        .logo {
+            font-size: 48px;
+            margin-bottom: 20px;
+        }
+
+        h1 {
+            color: #333;
+            margin-bottom: 10px;
+            font-size: 32px;
+        }
+
+        .subtitle {
+            color: #666;
+            margin-bottom: 40px;
+            font-size: 14px;
+        }
+
+        .counter-display {
+            font-size: 120px;
+            font-weight: bold;
+            color: #667eea;
+            margin: 40px 0;
+            text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.1);
+        }
+
+        .buttons {
+            display: flex;
+            gap: 15px;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+
+        button {
+            padding: 15px 30px;
+            font-size: 18px;
+            font-weight: 600;
+            border: none;
+            border-radius: 10px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            min-width: 120px;
+        }
+
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 12px rgba(0, 0, 0, 0.15);
+        }
+
+        button:active {
+            transform: translateY(0);
+        }
+
+        .btn-increment {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+
+        .btn-decrement {
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+            color: white;
+        }
+
+        .btn-reset {
+            background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+            color: white;
+        }
+
+        .loading {
+            color: #666;
+            font-size: 16px;
+            margin-top: 20px;
+        }
+
+        .status {
+            margin-top: 30px;
+            padding: 15px;
+            border-radius: 10px;
+            font-size: 14px;
+        }
+
+        .status.success {
+            background: #d4edda;
+            color: #155724;
+        }
+
+        .status.error {
+            background: #f8d7da;
+            color: #721c24;
+        }
+
+        .powered-by {
+            margin-top: 40px;
+            color: #999;
+            font-size: 12px;
+        }
+
+        .powered-by a {
+            color: #667eea;
+            text-decoration: none;
+            font-weight: 600;
+        }
+
+        .powered-by a:hover {
+            text-decoration: underline;
+        }
+
+        @media (max-width: 600px) {
+            .container {
+                padding: 40px 30px;
+            }
+
+            .counter-display {
+                font-size: 80px;
+            }
+
+            button {
+                min-width: 100px;
+                padding: 12px 24px;
+                font-size: 16px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="logo">🌊</div>
+        <h1>Ripple Counter</h1>
+        <p class="subtitle">WebAssembly + Reactive Signals</p>
+
+        <div id="counter-display" class="counter-display">0</div>
+
+        <div class="buttons">
+            <button id="btn-decrement" class="btn-decrement" disabled>− Decrement</button>
+            <button id="btn-increment" class="btn-increment" disabled>+ Increment</button>
+            <button id="btn-reset" class="btn-reset" disabled>↻ Reset</button>
+        </div>
+
+        <div id="status" class="loading">Loading WASM module...</div>
+
+        <div class="powered-by">
+            Powered by <a href="https://github.com/ghostkellz/ripple" target="_blank">Ripple</a> ⚡
+        </div>
+    </div>
+
+    <script src="ripple.js"></script>
+</body>
+</html>

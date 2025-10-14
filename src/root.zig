@@ -4,6 +4,9 @@ const core = @import("core.zig");
 const dom = @import("dom.zig");
 const template = @import("template.zig");
 const render = @import("render.zig");
+const component = @import("component.zig");
+const control_flow = @import("control_flow.zig");
+const router = @import("router.zig");
 
 pub const EffectCallback = core.EffectCallback;
 pub const EffectContext = core.EffectContext;
@@ -159,6 +162,22 @@ pub const hostCreateText = dom.hostCreateText;
 pub const hostAppendChild = dom.hostAppendChild;
 pub const hostSetAttribute = dom.hostSetAttribute;
 pub const hostSetText = dom.hostSetText;
+pub const View = component.View;
+pub const ViewBuilder = component.ViewBuilder;
+pub const Props = component.Props;
+pub const ComponentScope = component.ComponentScope;
+pub const createComponent = component.createComponent;
+pub const Show = control_flow.Show;
+pub const For = control_flow.For;
+pub const ForOptions = control_flow.ForOptions;
+pub const Switch = control_flow.Switch;
+pub const Match = control_flow.Match;
+pub const Router = router.Router;
+pub const Route = router.Route;
+pub const RouteParams = router.RouteParams;
+pub const RouteMatch = router.RouteMatch;
+pub const RouteGuard = router.RouteGuard;
+pub const Link = router.Link;
 
 test "effects react to signal updates" {
     const allocator = std.testing.allocator;
