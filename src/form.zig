@@ -366,6 +366,8 @@ pub const FormStore = struct {
     validation_adapter: ?ValidationAdapter,
     pending_async: std.ArrayList(PendingValidation),
     processing_async: bool,
+    validation_batch_depth: usize,
+    batched_validations: std.ArrayList(*FieldState),
 
     pub fn init(allocator: std.mem.Allocator, options: FormStoreOptions) !FormStore {
         return .{
@@ -382,6 +384,8 @@ pub const FormStore = struct {
             .validation_adapter = options.validation,
             .pending_async = std.ArrayList(PendingValidation).init(allocator),
             .processing_async = false,
+            .validation_batch_depth = 0,
+            .batched_validations = std.ArrayList(*FieldState).init(allocator),
         };
     }
 
@@ -391,6 +395,7 @@ pub const FormStore = struct {
             pending.future.deinit();
         }
         self.pending_async.deinit();
+        self.batched_validations.deinit();
         var it = self.fields.iterator();
         while (it.next()) |entry| {
             entry.value_ptr.deinit(self.allocator);
@@ -619,6 +624,186 @@ pub const FormStore = struct {
         return self.validating_signal.read;
     }
 
+    pub fn beginValidationBatch(self: *FormStore) ValidationBatchGuard {
+        self.validation_batch_depth += 1;
+        return ValidationBatchGuard{ .store = self, .active = true };
+    }
+
+    pub fn withValidationBatch(
+        self: *FormStore,
+        callback: *const fn (*FormStore, ?*anyopaque) anyerror!void,
+        context: ?*anyopaque,
+    ) !void {
+        var guard = self.beginValidationBatch();
+        defer guard.deinit();
+        try callback(self, context);
+        try guard.finish();
+    }
+
+    fn endValidationBatch(self: *FormStore) !void {
+        std.debug.assert(self.validation_batch_depth > 0);
+        self.validation_batch_depth -= 1;
+        if (self.validation_batch_depth == 0) {
+            try self.flushBatchedValidations();
+        }
+    }
+
+    fn flushBatchedValidations(self: *FormStore) !void {
+        var i: usize = 0;
+        while (i < self.batched_validations.items.len) : (i += 1) {
+            const field = self.batched_validations.items[i];
+            try self.performValidation(field);
+        }
+        self.batched_validations.clearRetainingCapacity();
+    }
+
+    pub const ValidationBatchGuard = struct {
+        store: *FormStore,
+        active: bool,
+
+        pub fn finish(self: *@This()) !void {
+            if (!self.active) return;
+            self.active = false;
+            try self.store.endValidationBatch();
+        }
+
+        pub fn deinit(self: *@This()) void {
+            if (!self.active) return;
+            self.active = false;
+            self.store.endValidationBatch() catch {};
+        }
+    };
+
+    const TimeFn = *const fn () i128;
+
+    fn defaultTimeSource() i128 {
+        return std.time.nanoTimestamp();
+    }
+
+    pub const ValidationDebouncer = struct {
+        store: *FormStore,
+        delay_ns: u64,
+        clock: TimeFn,
+        guard: ValidationBatchGuard,
+        deadline: i128,
+        active: bool,
+
+        pub fn init(store: *FormStore, delay_ns: u64, clock: ?TimeFn) ValidationDebouncer {
+            return .{
+                .store = store,
+                .delay_ns = delay_ns,
+                .clock = clock orelse defaultTimeSource,
+                .guard = undefined,
+                .deadline = 0,
+                .active = false,
+            };
+        }
+
+        fn ensureGuard(self: *@This()) void {
+            if (!self.active) {
+                self.guard = self.store.beginValidationBatch();
+                self.active = true;
+            }
+        }
+
+        pub fn touch(self: *@This()) void {
+            self.ensureGuard();
+            const delay = @as(i128, @intCast(self.delay_ns));
+            self.deadline = self.clock() + delay;
+        }
+
+        pub fn tick(self: *@This()) !void {
+            if (!self.active) return;
+            if (self.clock() >= self.deadline) {
+                defer self.active = false;
+                try self.guard.finish();
+            }
+        }
+
+        pub fn cancel(self: *@This()) void {
+            if (!self.active) return;
+            self.guard.deinit();
+            self.active = false;
+        }
+
+        pub fn isActive(self: ValidationDebouncer) bool {
+            return self.active;
+        }
+    };
+
+    pub const ValidationThrottler = struct {
+        store: *FormStore,
+        interval_ns: u64,
+        clock: TimeFn,
+        guard: ValidationBatchGuard,
+        has_guard: bool,
+        cooldown_until: i128,
+        flush_at: i128,
+
+        pub fn init(store: *FormStore, interval_ns: u64, clock: ?TimeFn) ValidationThrottler {
+            return .{
+                .store = store,
+                .interval_ns = interval_ns,
+                .clock = clock orelse defaultTimeSource,
+                .guard = undefined,
+                .has_guard = false,
+                .cooldown_until = std.math.minInt(i128),
+                .flush_at = std.math.minInt(i128),
+            };
+        }
+
+        fn interval(self: ValidationThrottler) i128 {
+            return @as(i128, @intCast(self.interval_ns));
+        }
+
+        pub fn touch(self: *@This()) void {
+            const now = self.clock();
+            if (now >= self.cooldown_until) {
+                if (self.has_guard) {
+                    self.guard.deinit();
+                    self.has_guard = false;
+                }
+                self.cooldown_until = now + self.interval();
+                self.flush_at = self.cooldown_until;
+                return;
+            }
+
+            if (!self.has_guard) {
+                self.guard = self.store.beginValidationBatch();
+                self.has_guard = true;
+                self.flush_at = self.cooldown_until;
+            }
+        }
+
+        pub fn tick(self: *@This()) !void {
+            if (!self.has_guard) {
+                const now = self.clock();
+                if (now >= self.cooldown_until) {
+                    self.cooldown_until = now;
+                }
+                return;
+            }
+
+            if (self.clock() >= self.flush_at) {
+                try self.guard.finish();
+                self.has_guard = false;
+                const now = self.clock();
+                self.cooldown_until = now + self.interval();
+                self.flush_at = self.cooldown_until;
+            }
+        }
+
+        pub fn cancel(self: *@This()) void {
+            if (!self.has_guard) return;
+            self.guard.deinit();
+            self.has_guard = false;
+        }
+
+        pub fn isGuardActive(self: ValidationThrottler) bool {
+            return self.has_guard;
+        }
+    };
+
     pub fn snapshot(self: *FormStore) FormSnapshot {
         return .{
             .dirty = self.dirty_count > 0,
@@ -629,6 +814,23 @@ pub const FormStore = struct {
     }
 
     fn applyValidation(self: *FormStore, field: *FieldState) !void {
+        if (self.validation_batch_depth > 0) {
+            if (!field.pending_validation) {
+                field.pending_validation = true;
+                self.batched_validations.append(field) catch |err| {
+                    field.pending_validation = false;
+                    return err;
+                };
+            }
+            return;
+        }
+
+        try self.performValidation(field);
+    }
+
+    fn performValidation(self: *FormStore, field: *FieldState) !void {
+        field.pending_validation = false;
+
         if (self.validation_adapter) |adapter| {
             self.cancelPendingValidation(field);
             const result = try adapter.validate(field.name, field.current, self.allocator);
@@ -663,6 +865,7 @@ const FieldState = struct {
     touched_state: bool,
     valid_state: bool,
     validating_state: bool,
+    pending_validation: bool,
     error_message: []u8,
     value_signal: core.SignalPair([]const u8),
     dirty_signal: core.SignalPair(bool),
@@ -707,6 +910,7 @@ const FieldState = struct {
             .touched_state = false,
             .valid_state = true,
             .validating_state = false,
+            .pending_validation = false,
             .error_message = &[_]u8{},
             .value_signal = value_signal,
             .dirty_signal = dirty_signal,
@@ -1414,6 +1618,266 @@ test "async validation resolves outcomes" {
     try expectBoolSignal(view.validating, false);
     try expectBoolSignal(view.valid, false);
     try expectStringSignal(view.error_message, "Name already used");
+}
+
+test "async validation cancellation replaces pending outcome" {
+    const AsyncContext = struct {
+        allocator: std.mem.Allocator,
+        futures: std.ArrayList(*zsync.Future(ValidationOutcome)),
+
+        fn create(allocator: std.mem.Allocator) !*@This() {
+            const ctx = try allocator.create(@This());
+            errdefer allocator.destroy(ctx);
+            ctx.* = .{
+                .allocator = allocator,
+                .futures = std.ArrayList(*zsync.Future(ValidationOutcome)).init(allocator),
+            };
+            return ctx;
+        }
+
+        fn destroy(self: *@This()) void {
+            for (self.futures.items) |future| {
+                future.cancel();
+                future.deinit();
+            }
+            self.futures.deinit();
+            self.allocator.destroy(self);
+        }
+
+        fn validate(_: []const u8, _: []const u8, _: std.mem.Allocator, ctx_ptr: ?*anyopaque) anyerror!ValidationResult {
+            const ctx = @as(*@This(), @ptrFromInt(@intFromPtr(ctx_ptr.?)));
+            if (ctx.futures.popOrNull()) |future| {
+                return ValidationResult{ .future = AsyncValidation{ .future = future } };
+            }
+            return ValidationResult{ .immediate = ValidationOutcome{} };
+        }
+
+        fn deinitContext(_: std.mem.Allocator, ctx_ptr: ?*anyopaque) void {
+            if (ctx_ptr) |ptr| {
+                @as(*@This(), @ptrFromInt(@intFromPtr(ptr))).destroy();
+            }
+        }
+    };
+
+    var ctx = try AsyncContext.create(testing.allocator);
+    var ctx_cleanup = true;
+    defer if (ctx_cleanup) ctx.destroy();
+
+    var store = try FormStore.init(testing.allocator, .{
+        .validation = .{
+            .validateField = AsyncContext.validate,
+            .deinitContext = AsyncContext.deinitContext,
+            .context = ctx,
+        },
+    });
+    defer store.deinit();
+    ctx_cleanup = false;
+
+    const first_future = try zsync.Future(ValidationOutcome).init(testing.allocator);
+    try ctx.futures.append(first_future);
+
+    try store.registerField(.{ .name = "username", .initial = "" });
+    try expectBoolSignal(store.validatingSignal(), true);
+    const view = store.fieldView("username") orelse return error.TestUnexpectedResult;
+    try expectBoolSignal(view.validating, true);
+    try testing.expectEqual(@as(usize, 1), store.pending_async.items.len);
+    const initial_future_addr = @intFromPtr(store.pending_async.items[0].future);
+
+    const second_future = try zsync.Future(ValidationOutcome).init(testing.allocator);
+    try ctx.futures.append(second_future);
+
+    try store.setValue("username", "next");
+
+    try testing.expectEqual(@as(usize, 1), store.pending_async.items.len);
+    const active_future_addr = @intFromPtr(store.pending_async.items[0].future);
+    try testing.expect(active_future_addr != initial_future_addr);
+    try expectBoolSignal(store.validatingSignal(), true);
+    try expectBoolSignal(view.validating, true);
+    try expectStringSignal(view.error_message, "");
+
+    second_future.resolve(.{ .valid = false, .message = "Still taken" });
+    try store.tickAsyncValidations();
+
+    try expectBoolSignal(store.validatingSignal(), false);
+    try expectBoolSignal(store.validSignal(), false);
+    try expectBoolSignal(view.validating, false);
+    try expectBoolSignal(view.valid, false);
+    try expectStringSignal(view.error_message, "Still taken");
+}
+
+test "validation batches coalesce adapter calls" {
+    const CountingContext = struct {
+        count: usize = 0,
+
+        fn validate(_: []const u8, _: []const u8, _: std.mem.Allocator, ctx_ptr: ?*anyopaque) anyerror!ValidationResult {
+            const ctx = @as(*@This(), @ptrFromInt(@intFromPtr(ctx_ptr.?)));
+            ctx.count += 1;
+            return ValidationResult{ .immediate = ValidationOutcome{} };
+        }
+    };
+
+    var ctx = CountingContext{};
+
+    var store = try FormStore.init(testing.allocator, .{
+        .validation = .{
+            .validateField = CountingContext.validate,
+            .deinitContext = null,
+            .context = @as(*anyopaque, @ptrCast(&ctx)),
+        },
+    });
+    defer store.deinit();
+
+    try store.registerField(.{ .name = "username", .initial = "" });
+    ctx.count = 0;
+
+    var batch = store.beginValidationBatch();
+    defer batch.deinit();
+
+    try store.setValue("username", "a");
+    try store.setValue("username", "ab");
+    try store.setValue("username", "abc");
+
+    try testing.expectEqual(@as(usize, 0), ctx.count);
+
+    try batch.finish();
+
+    try testing.expectEqual(@as(usize, 1), ctx.count);
+    try expectStringSignal(store.fieldView("username").?.value, "abc");
+
+    ctx.count = 0;
+    try store.setValue("username", "abcd");
+    try testing.expectEqual(@as(usize, 1), ctx.count);
+}
+
+test "validation debouncer delays until tick" {
+    const CountingContext = struct {
+        count: usize = 0,
+
+        fn validate(_: []const u8, _: []const u8, _: std.mem.Allocator, ctx_ptr: ?*anyopaque) anyerror!ValidationResult {
+            const ctx = @as(*@This(), @ptrFromInt(@intFromPtr(ctx_ptr.?)));
+            ctx.count += 1;
+            return ValidationResult{ .immediate = ValidationOutcome{} };
+        }
+    };
+
+    const TestClock = struct {
+        var now: i128 = 0;
+
+        fn nowFn() i128 {
+            return now;
+        }
+    };
+
+    var ctx = CountingContext{};
+
+    var store = try FormStore.init(testing.allocator, .{
+        .validation = .{
+            .validateField = CountingContext.validate,
+            .deinitContext = null,
+            .context = @as(*anyopaque, @ptrCast(&ctx)),
+        },
+    });
+    defer store.deinit();
+
+    try store.registerField(.{ .name = "username", .initial = "" });
+    ctx.count = 0;
+
+    var debouncer = FormStore.ValidationDebouncer.init(&store, 10, TestClock.nowFn);
+
+    TestClock.now = 0;
+    debouncer.touch();
+    try store.setValue("username", "a");
+    try store.setValue("username", "ab");
+    try testing.expectEqual(@as(usize, 0), ctx.count);
+
+    TestClock.now = 9;
+    try debouncer.tick();
+    try testing.expectEqual(@as(usize, 0), ctx.count);
+
+    TestClock.now = 10;
+    try debouncer.tick();
+    try testing.expectEqual(@as(usize, 1), ctx.count);
+
+    TestClock.now = 15;
+    debouncer.touch();
+    try store.setValue("username", "abc");
+    try testing.expectEqual(@as(usize, 1), ctx.count);
+
+    TestClock.now = 24;
+    try debouncer.tick();
+    try testing.expectEqual(@as(usize, 1), ctx.count);
+
+    TestClock.now = 25;
+    try debouncer.tick();
+    try testing.expectEqual(@as(usize, 2), ctx.count);
+
+    debouncer.cancel();
+}
+
+test "validation throttler limits validation frequency" {
+    const CountingContext = struct {
+        count: usize = 0,
+
+        fn validate(_: []const u8, _: []const u8, _: std.mem.Allocator, ctx_ptr: ?*anyopaque) anyerror!ValidationResult {
+            const ctx = @as(*@This(), @ptrFromInt(@intFromPtr(ctx_ptr.?)));
+            ctx.count += 1;
+            return ValidationResult{ .immediate = ValidationOutcome{} };
+        }
+    };
+
+    const TestClock = struct {
+        var now: i128 = 0;
+
+        fn nowFn() i128 {
+            return now;
+        }
+    };
+
+    var ctx = CountingContext{};
+
+    var store = try FormStore.init(testing.allocator, .{
+        .validation = .{
+            .validateField = CountingContext.validate,
+            .deinitContext = null,
+            .context = @as(*anyopaque, @ptrCast(&ctx)),
+        },
+    });
+    defer store.deinit();
+
+    try store.registerField(.{ .name = "username", .initial = "" });
+    ctx.count = 0;
+
+    var throttler = FormStore.ValidationThrottler.init(&store, 10, TestClock.nowFn);
+
+    TestClock.now = 0;
+    throttler.touch();
+    try store.setValue("username", "first");
+    try testing.expectEqual(@as(usize, 1), ctx.count);
+
+    TestClock.now = 5;
+    throttler.touch();
+    try store.setValue("username", "second");
+    try testing.expectEqual(@as(usize, 1), ctx.count);
+
+    TestClock.now = 8;
+    throttler.touch();
+    try store.setValue("username", "third");
+    try testing.expectEqual(@as(usize, 1), ctx.count);
+
+    TestClock.now = 10;
+    try throttler.tick();
+    try testing.expectEqual(@as(usize, 2), ctx.count);
+
+    TestClock.now = 15;
+    throttler.touch();
+    try store.setValue("username", "fourth");
+    try testing.expectEqual(@as(usize, 2), ctx.count);
+
+    TestClock.now = 21;
+    try throttler.tick();
+    try testing.expectEqual(@as(usize, 3), ctx.count);
+
+    throttler.cancel();
 }
 
 test "form submit binding prevents default when invalid" {

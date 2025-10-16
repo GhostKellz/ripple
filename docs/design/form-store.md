@@ -44,6 +44,10 @@ const password_error = try password.error_message.get();
 - `SerializedField` — disposable entries containing `value`, `dirty`, `touched`, `validating`, `valid`, and `error_message` metadata.
 - `ValidationAdapter` — trait object with `validate(field, value)` and optional context destructor.
 - `ValidationResult` — union between immediate `ValidationOutcome` responses and async futures for deferred checks.
+- `AsyncValidation` — wrapper around `zsync.Future(ValidationOutcome)` used to represent in-flight checks.
+- `ValidationBatchGuard` — RAII helper returned by `FormStore.beginValidationBatch()` to coalesce repeated validations within a critical section.
+- `ValidationDebouncer` — controller that postpones validation flushes until a configurable delay elapses.
+- `ValidationThrottler` — controller that enforces a minimum interval between validation flushes.
 - `ZSchemaMinLengthRule` — helper rule used by the bundled min-length adapter prototype.
 
 ### Errors
@@ -61,13 +65,16 @@ const password_error = try password.error_message.get();
 - `FieldView` exposes `value`, `dirty`, `touched`, `validating`, `valid`, and `error_message` read signals for ergonomic bindings.
 - Resets update signals and counts to keep downstream effects consistent.
 - Utility helpers: `markAllTouched()` flips every field into the touched state (useful before submit), `validateAll()` re-runs adapters over the current values, `tickAsyncValidations()` drains resolved futures, and `serialize()` returns a disposable snapshot (`SerializedForm`) of field values/errors for logging or analytics.
+- `beginValidationBatch()` defers adapter invocations until the guard completes, coalescing multiple value writes into a single validation pass per field.
+- `withValidationBatch()` offers a convenience wrapper around the guard for callers who prefer higher-order helpers over manual RAII.
+- Debounce/throttle controllers expose `touch()`/`tick()` methods so hosts can wire in their own scheduling primitives while still benefiting from batched validation.
 
 ## Validation Adapters
 - `ValidationAdapter` wraps schema engines behind a shared interface that receives `(field, value, allocator, context)` and returns a `ValidationResult`.
 - Async results surface via `zsync.Future(ValidationOutcome)` futures; pending work flips the affected field (and aggregates) into a validating state until resolved or cancelled.
-- Adapters may allocate per-schema context; `FormStore` owns the adapter instance and invokes the optional `deinitContext` hook on teardown.
-- `createZSchemaMinLengthAdapter` is the first prototype adapter translating simple min-length rules into the shared interface. Rules deduplicate per field, retain custom messages, and run on every register/reset/value change.
-- Adapter results drive both per-field signals (`validating`, `valid`, `error_message`) and the aggregate `validatingSignal`/`validSignal`/`FormSnapshot` mirrors by maintaining `invalid_count` and `validating_count` counters.
+- When a new async validation is scheduled for the same field, the previous future is cancelled, a `"Validation cancelled"` message is surfaced, and the store keeps the field in a validating state until the replacement future resolves.
+- Validation batches let callers delay adapter invocations across a critical section, ensuring only the latest value for each field is validated when the guard completes.
+- Debounce and throttle controllers build on batching, trading immediate validation for time-based coalescing. Both rely on periodic `tick()` calls (e.g., from an event loop) to flush pending guards once their timers expire.
 
 ## Progressive Enhancement
 - `bindFormSubmit` wires native `<form>` submit events to the store. It marks all fields as touched, re-runs validation, and (by default) prevents submission when the form is invalid.
