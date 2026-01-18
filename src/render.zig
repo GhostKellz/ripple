@@ -428,7 +428,7 @@ pub fn mountRenderProgram(
                 try parent_stack.append(allocator, current_parent);
                 current_parent = node_id;
             },
-            .close_element => |_| {
+            .close_element => {
                 if (parent_stack.items.len == 0) return RenderError.StackUnderflow;
                 current_parent = parent_stack.items[parent_stack.items.len - 1];
                 parent_stack.items.len -= 1;
@@ -461,7 +461,7 @@ pub fn mountRenderProgram(
                     .start_dynamic = dynamic_index,
                 });
             },
-            .island_end => |_| {
+            .island_end => {
                 if (island_stack.items.len == 0) return RenderError.StackUnderflow;
                 const frame = island_stack.items[island_stack.items.len - 1];
                 _ = island_stack.pop();
@@ -483,7 +483,7 @@ pub fn mountRenderProgram(
                 });
                 current_parent = portal_parent;
             },
-            .portal_end => |_| {
+            .portal_end => {
                 if (portal_stack.items.len == 0) return RenderError.StackUnderflow;
                 const frame = portal_stack.items[portal_stack.items.len - 1];
                 portal_stack.items.len -= 1;
@@ -505,14 +505,14 @@ pub fn mountRenderProgram(
                     .has_fallback = false,
                 });
             },
-            .suspense_fallback => |_| {
+            .suspense_fallback => {
                 if (suspense_stack.items.len == 0) return RenderError.StackUnderflow;
                 var frame = &suspense_stack.items[suspense_stack.items.len - 1];
                 frame.main_end = dynamic_index;
                 frame.fallback_start = dynamic_index;
                 frame.has_fallback = true;
             },
-            .suspense_end => |_| {
+            .suspense_end => {
                 if (suspense_stack.items.len == 0) return RenderError.StackUnderflow;
                 const frame = suspense_stack.items[suspense_stack.items.len - 1];
                 suspense_stack.items.len -= 1;
@@ -727,7 +727,7 @@ pub fn hydrateRenderProgram(
                 const actual = dom.hostHydrationText(node_id);
                 if (!std.mem.eql(u8, actual, text_value)) return RenderError.HydrationMismatch;
             },
-            .dynamic_text => |_| {
+            .dynamic_text => {
                 if (dynamic_index >= dynamic_nodes.len) return RenderError.HydrationMismatch;
                 const node_id = try current_parent.nextStructural();
                 if (dom.hostHydrationNodeType(node_id) != .text) return RenderError.UnexpectedNode;
@@ -743,7 +743,7 @@ pub fn hydrateRenderProgram(
                     .start_dynamic = dynamic_index,
                 });
             },
-            .island_end => |_| {
+            .island_end => {
                 try current_parent.consumeMarker("/island", null);
                 if (island_stack.items.len == 0) return RenderError.StackUnderflow;
                 const idx = island_stack.items.len - 1;
@@ -769,7 +769,7 @@ pub fn hydrateRenderProgram(
                     .parent_index = parent_index,
                 });
             },
-            .portal_end => |_| {
+            .portal_end => {
                 if (portal_stack.items.len == 0) return RenderError.StackUnderflow;
                 const frame = portal_stack.items[portal_stack.items.len - 1];
                 portal_stack.items.len -= 1;
@@ -795,7 +795,7 @@ pub fn hydrateRenderProgram(
                     .has_fallback = false,
                 });
             },
-            .suspense_fallback => |_| {
+            .suspense_fallback => {
                 try current_parent.consumeMarker("suspense:", "fallback");
                 if (suspense_stack.items.len == 0) return RenderError.StackUnderflow;
                 var frame = &suspense_stack.items[suspense_stack.items.len - 1];
@@ -803,7 +803,7 @@ pub fn hydrateRenderProgram(
                 frame.fallback_start = dynamic_index;
                 frame.has_fallback = true;
             },
-            .suspense_end => |_| {
+            .suspense_end => {
                 try current_parent.consumeMarker("/suspense", null);
                 if (suspense_stack.items.len == 0) return RenderError.StackUnderflow;
                 const frame = suspense_stack.items[suspense_stack.items.len - 1];

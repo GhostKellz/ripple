@@ -86,6 +86,7 @@ pub const ValidationAdapter = struct {
         }
         try self.applyValidationOutcome(field, outcome);
         try self.validating_signal.write.set(self.validating_count > 0);
+        try self.triggerCrossFieldValidations(field.name);
     }
 
     fn applyValidationOutcome(self: *FormStore, field: *FieldState, outcome: ValidationOutcome) !void {
@@ -124,6 +125,7 @@ pub const ValidationAdapter = struct {
                             try field.validating_signal.write.set(false);
                         }
                         try self.applyValidationOutcome(field, .{ .valid = false, .message = VALIDATION_CANCELLED_MSG });
+                        try self.triggerCrossFieldValidations(field.name);
                     } else {
                         if (self.validating_count > 0) self.validating_count -= 1;
                     }
@@ -269,6 +271,7 @@ pub fn createZSchemaMinLengthAdapter(
 
 pub const FormStoreOptions = struct {
     validation: ?ValidationAdapter = null,
+    schema: ?SchemaValidationConfig = null,
 };
 
 pub const FieldConfig = struct {
@@ -355,6 +358,7 @@ const PendingValidation = struct {
 pub const FormStore = struct {
     allocator: std.mem.Allocator,
     fields: std.StringHashMap(FieldState),
+    field_order: std.ArrayList([]const u8),
     dirty_count: usize,
     touched_count: usize,
     invalid_count: usize,
@@ -368,11 +372,17 @@ pub const FormStore = struct {
     processing_async: bool,
     validation_batch_depth: usize,
     batched_validations: std.ArrayList(*FieldState),
+    cross_validations: std.ArrayList(CrossValidation),
 
     pub fn init(allocator: std.mem.Allocator, options: FormStoreOptions) !FormStore {
-        return .{
+        if (options.validation != null and options.schema != null) {
+            return error.ConflictingValidationAdapters;
+        }
+
+        var store = FormStore{
             .allocator = allocator,
             .fields = std.StringHashMap(FieldState).init(allocator),
+            .field_order = std.ArrayList([]const u8).init(allocator),
             .dirty_count = 0,
             .touched_count = 0,
             .invalid_count = 0,
@@ -381,12 +391,27 @@ pub const FormStore = struct {
             .touched_signal = try core.createSignal(bool, allocator, false),
             .valid_signal = try core.createSignal(bool, allocator, true),
             .validating_signal = try core.createSignal(bool, allocator, false),
-            .validation_adapter = options.validation,
+            .validation_adapter = null,
             .pending_async = std.ArrayList(PendingValidation).init(allocator),
             .processing_async = false,
             .validation_batch_depth = 0,
             .batched_validations = std.ArrayList(*FieldState).init(allocator),
+            .cross_validations = std.ArrayList(CrossValidation).init(allocator),
         };
+
+        errdefer store.deinit();
+
+        if (options.validation) |adapter| {
+            store.validation_adapter = adapter;
+        } else if (options.schema) |schema_config| {
+            store.validation_adapter = try createSchemaValidationAdapter(allocator, schema_config);
+        }
+
+        if (options.schema) |schema_config| {
+            try installSchemaCrossFieldRules(allocator, &store, schema_config.cross_fields);
+        }
+
+        return store;
     }
 
     pub fn deinit(self: *FormStore) void {
@@ -395,6 +420,11 @@ pub const FormStore = struct {
             pending.future.deinit();
         }
         self.pending_async.deinit();
+        self.field_order.deinit();
+        for (self.cross_validations.items) |*entry| {
+            entry.deinit(self.allocator);
+        }
+        self.cross_validations.deinit();
         self.batched_validations.deinit();
         var it = self.fields.iterator();
         while (it.next()) |entry| {
@@ -415,11 +445,22 @@ pub const FormStore = struct {
         if (self.fields.get(config.name) != null) return error.DuplicateField;
 
         var field = try FieldState.init(self.allocator, config);
-        errdefer field.deinit(self.allocator);
+        var field_cleanup = true;
+        defer if (field_cleanup) field.deinit(self.allocator);
 
         try self.fields.put(field.name, field);
+        field_cleanup = false;
+
         const stored = self.fields.getPtr(field.name) orelse unreachable;
+        var stored_cleanup = true;
+        defer if (stored_cleanup) {
+            _ = self.fields.remove(stored.name);
+            stored.deinit(self.allocator);
+        };
+
+        try self.field_order.append(stored.name);
         try self.applyValidation(stored);
+        stored_cleanup = false;
     }
 
     pub fn setValue(self: *FormStore, name: []const u8, value: []const u8) !void {
@@ -570,9 +611,8 @@ pub const FormStore = struct {
             list.deinit();
         }
 
-        var it = self.fields.iterator();
-        while (it.next()) |entry| {
-            const field = entry.value_ptr;
+        for (self.field_order.items) |field_name| {
+            const field = self.fields.getPtr(field_name) orelse continue;
             const name_copy = try allocator.dupe(u8, field.name);
             errdefer allocator.free(name_copy);
 
@@ -599,6 +639,112 @@ pub const FormStore = struct {
 
         const owned = try list.toOwnedSlice();
         return SerializedForm{ .allocator = allocator, .fields = owned };
+    }
+
+    pub fn firstInvalidFieldName(self: *FormStore) ?[]const u8 {
+        for (self.field_order.items) |field_name| {
+            const field = self.fields.getPtr(field_name) orelse continue;
+            if (!field.valid_state or field.error_message.len != 0) {
+                return field.name;
+            }
+        }
+        return null;
+    }
+
+    pub fn focusFirstInvalidField(
+        self: *FormStore,
+        focus: *const fn ([]const u8, ?*anyopaque) anyerror!void,
+        context: ?*anyopaque,
+    ) anyerror!bool {
+        if (self.firstInvalidFieldName()) |name| {
+            try focus(name, context);
+            return true;
+        }
+        return false;
+    }
+
+    pub fn collectErrorSummary(self: *FormStore, allocator: std.mem.Allocator) !ErrorSummary {
+        var list = std.ArrayList(ErrorSummaryItem).init(allocator);
+        var list_cleanup = true;
+        defer if (list_cleanup) {
+            for (list.items) |entry| {
+                allocator.free(@constCast(entry.field));
+                if (entry.message.len > 0) {
+                    allocator.free(@constCast(entry.message));
+                }
+            }
+            list.deinit();
+        };
+
+        for (self.field_order.items) |field_name| {
+            const field = self.fields.getPtr(field_name) orelse continue;
+            if (field.valid_state and field.error_message.len == 0) continue;
+
+            const field_copy = try allocator.dupe(u8, field.name);
+            var field_cleanup = true;
+            defer if (field_cleanup) allocator.free(field_copy);
+
+            var message_copy: []const u8 = &[_]u8{};
+            var message_cleanup = false;
+            if (field.error_message.len > 0) {
+                const dup = try allocator.dupe(u8, field.error_message);
+                message_copy = dup;
+                message_cleanup = true;
+            }
+            defer if (message_cleanup and message_copy.len > 0) allocator.free(@constCast(message_copy));
+
+            try list.append(.{ .field = field_copy, .message = message_copy });
+            field_cleanup = false;
+            message_cleanup = false;
+        }
+
+        const items = try list.toOwnedSlice();
+        list_cleanup = false;
+        return ErrorSummary{ .allocator = allocator, .items = items };
+    }
+
+    pub fn buildErrorSummaryView(
+        self: *FormStore,
+        allocator: std.mem.Allocator,
+        heading: []const u8,
+    ) !component.View {
+        var summary = try self.collectErrorSummary(allocator);
+        defer summary.deinit();
+
+        if (summary.items.len == 0) {
+            const builder = component.ViewBuilder.init(allocator);
+            return builder.fragment(&.{});
+        }
+
+        var builder = component.ViewBuilder.init(allocator);
+
+        const heading_text = try builder.text(heading);
+        const heading_view = try builder.element("h2", &.{}, &.{ heading_text });
+
+        var list_items = std.ArrayList(component.View).init(allocator);
+        defer list_items.deinit();
+
+        for (summary.items) |item| {
+            const formatted = if (item.message.len == 0)
+                try std.fmt.allocPrint(allocator, "{s} is invalid", .{ item.field })
+            else
+                try std.fmt.allocPrint(allocator, "{s}: {s}", .{ item.field, item.message });
+            defer allocator.free(formatted);
+
+            const text = try builder.text(formatted);
+            const data_attr = try builder.attr("data-field", item.field);
+            const li = try builder.element("li", &.{ data_attr }, &.{ text });
+            try list_items.append(li);
+        }
+
+        const list_class = try builder.attr("class", "form-error-summary__list");
+        const list_view = try builder.element("ul", &.{ list_class }, list_items.items);
+
+        const role_attr = try builder.attr("role", "alert");
+        const aria_live = try builder.attr("aria-live", "polite");
+        const wrapper_class = try builder.attr("class", "form-error-summary");
+        const tab_attr = try builder.attr("tabindex", "-1");
+        return builder.element("div", &.{ role_attr, aria_live, wrapper_class, tab_attr }, &.{ heading_view, list_view });
     }
 
     pub fn tickAsyncValidations(self: *FormStore) !void {
@@ -655,6 +801,101 @@ pub const FormStore = struct {
             try self.performValidation(field);
         }
         self.batched_validations.clearRetainingCapacity();
+    }
+
+    pub const CrossFieldValidationConfig = struct {
+        field: []const u8,
+        dependencies: []const []const u8,
+        validate: *const fn (*FormStore, []const u8, ?*anyopaque) anyerror!ValidationOutcome,
+        context: ?*anyopaque = null,
+        deinitContext: ?*const fn (std.mem.Allocator, ?*anyopaque) void = null,
+    };
+
+    const CrossValidation = struct {
+        target_field: []u8,
+        dependencies: std.ArrayList([]u8),
+        validate: *const fn (*FormStore, []const u8, ?*anyopaque) anyerror!ValidationOutcome,
+        context: ?*anyopaque,
+        deinitContext: ?*const fn (std.mem.Allocator, ?*anyopaque) void,
+
+        fn init(allocator: std.mem.Allocator, config: CrossFieldValidationConfig) !CrossValidation {
+            const target = try allocator.dupe(u8, config.field);
+            var target_cleanup = true;
+            defer if (target_cleanup) allocator.free(target);
+
+            var deps = std.ArrayList([]u8).init(allocator);
+            var deps_cleanup = true;
+            defer if (deps_cleanup) {
+                for (deps.items) |dep| allocator.free(dep);
+                deps.deinit();
+            };
+
+            try deps.ensureTotalCapacity(config.dependencies.len);
+            for (config.dependencies) |name| {
+                const copy = try allocator.dupe(u8, name);
+                deps.appendAssumeCapacity(copy);
+            }
+
+            target_cleanup = false;
+            deps_cleanup = false;
+
+            return .{
+                .target_field = target,
+                .dependencies = deps,
+                .validate = config.validate,
+                .context = config.context,
+                .deinitContext = config.deinitContext,
+            };
+        }
+
+        fn dependsOn(self: *const CrossValidation, name: []const u8) bool {
+            if (std.mem.eql(u8, self.target_field, name)) return true;
+            for (self.dependencies.items) |dep| {
+                if (std.mem.eql(u8, dep, name)) return true;
+            }
+            return false;
+        }
+
+        fn deinit(self: *CrossValidation, allocator: std.mem.Allocator) void {
+            allocator.free(self.target_field);
+            for (self.dependencies.items) |dep| allocator.free(dep);
+            self.dependencies.deinit();
+            if (self.deinitContext) |deinit_fn| {
+                deinit_fn(allocator, self.context);
+            }
+        }
+    };
+
+    pub fn registerCrossFieldValidation(self: *FormStore, config: CrossFieldValidationConfig) !void {
+        try self.tickAsyncValidations();
+
+        var validation = try CrossValidation.init(self.allocator, config);
+        var owned = true;
+        defer if (owned) validation.deinit(self.allocator);
+
+        try self.cross_validations.append(validation);
+        owned = false;
+
+        const stored = &self.cross_validations.items[self.cross_validations.items.len - 1];
+        try self.triggerCrossFieldValidations(stored.target_field);
+    }
+
+    pub fn fieldValue(self: *FormStore, name: []const u8) ?[]const u8 {
+        if (self.fields.get(name)) |field| {
+            return field.current;
+        }
+        return null;
+    }
+
+    fn triggerCrossFieldValidations(self: *FormStore, changed_field: []const u8) !void {
+        var i: usize = 0;
+        while (i < self.cross_validations.items.len) : (i += 1) {
+            const entry = &self.cross_validations.items[i];
+            if (!entry.dependsOn(changed_field)) continue;
+            const target = self.fields.getPtr(entry.target_field) orelse continue;
+            const outcome = try entry.validate(self, entry.target_field, entry.context);
+            try self.applyValidationOutcome(target, outcome);
+        }
     }
 
     pub const ValidationBatchGuard = struct {
@@ -854,6 +1095,8 @@ pub const FormStore = struct {
                 try self.valid_signal.write.set(self.invalid_count == 0 and self.validating_count == 0);
             }
         }
+
+        try self.triggerCrossFieldValidations(field.name);
     }
 };
 
@@ -948,6 +1191,450 @@ const FieldState = struct {
     }
 };
 
+const SCHEMA_DEFAULT_MIN_MESSAGE = "Value is too short";
+const SCHEMA_DEFAULT_MAX_MESSAGE = "Value is too long";
+const SCHEMA_DEFAULT_EMAIL_MESSAGE = "Enter a valid email address";
+const SCHEMA_DEFAULT_MATCH_MESSAGE = "Values must match";
+
+pub const SchemaCustomRule = struct {
+    validate: *const fn ([]const u8, []const u8, std.mem.Allocator, ?*anyopaque) anyerror!ValidationResult,
+    context: ?*anyopaque = null,
+    deinitContext: ?*const fn (std.mem.Allocator, ?*anyopaque) void = null,
+};
+
+pub const SchemaRule = union(enum) {
+    minLength: struct {
+        min: usize,
+        message: []const u8 = &[_]u8{},
+    },
+    maxLength: struct {
+        max: usize,
+        message: []const u8 = &[_]u8{},
+    },
+    email: struct {
+        message: []const u8 = &[_]u8{},
+    },
+    custom: SchemaCustomRule,
+};
+
+pub const SchemaFieldConfig = struct {
+    field: []const u8,
+    rules: []const SchemaRule,
+};
+
+pub const SchemaMatchFieldRule = struct {
+    field: []const u8,
+    other_field: []const u8,
+    message: []const u8 = &[_]u8{},
+};
+
+pub const SchemaCrossFieldCustom = struct {
+    field: []const u8,
+    dependencies: []const []const u8,
+    validate: *const fn (*FormStore, []const u8, ?*anyopaque) anyerror!ValidationOutcome,
+    context: ?*anyopaque = null,
+    deinitContext: ?*const fn (std.mem.Allocator, ?*anyopaque) void = null,
+};
+
+pub const SchemaCrossFieldRule = union(enum) {
+    matchField: SchemaMatchFieldRule,
+    custom: SchemaCrossFieldCustom,
+};
+
+pub const SchemaValidationConfig = struct {
+    fields: []const SchemaFieldConfig,
+    cross_fields: []const SchemaCrossFieldRule = &.{},
+};
+
+pub const ErrorSummaryItem = struct {
+    field: []const u8,
+    message: []const u8,
+};
+
+pub const ErrorSummary = struct {
+    allocator: std.mem.Allocator,
+    items: []ErrorSummaryItem,
+
+    pub fn len(self: ErrorSummary) usize {
+        return self.items.len;
+    }
+
+    pub fn values(self: ErrorSummary) []const ErrorSummaryItem {
+        return self.items;
+    }
+
+    pub fn deinit(self: *ErrorSummary) void {
+        for (self.items) |entry| {
+            self.allocator.free(@constCast(entry.field));
+            if (entry.message.len > 0) {
+                self.allocator.free(@constCast(entry.message));
+            }
+        }
+        if (self.items.len > 0) {
+            self.allocator.free(self.items);
+        }
+        self.items = &.{};
+    }
+};
+
+const SchemaMessage = struct {
+    value: []const u8,
+    owns: bool,
+};
+
+fn makeSchemaMessage(allocator: std.mem.Allocator, provided: []const u8, fallback: []const u8) !SchemaMessage {
+    if (provided.len == 0) {
+        return .{ .value = fallback, .owns = false };
+    }
+
+    const duped = try allocator.dupe(u8, provided);
+    return .{ .value = duped, .owns = true };
+}
+
+fn releaseSchemaMessage(allocator: std.mem.Allocator, message: SchemaMessage) void {
+    if (message.owns and message.value.len > 0) {
+        allocator.free(@constCast(message.value));
+    }
+}
+
+const SchemaRuleRuntime = union(enum) {
+    min_length: struct {
+        min: usize,
+        message: []const u8,
+        owns_message: bool,
+    },
+    max_length: struct {
+        max: usize,
+        message: []const u8,
+        owns_message: bool,
+    },
+    email: struct {
+        message: []const u8,
+        owns_message: bool,
+    },
+    custom: SchemaCustomRule,
+};
+
+const SchemaFieldRules = struct {
+    rules: []SchemaRuleRuntime,
+
+    fn init(allocator: std.mem.Allocator, definitions: []const SchemaRule) !SchemaFieldRules {
+        if (definitions.len == 0) {
+            return .{ .rules = &.{} };
+        }
+
+        const buffer = try allocator.alloc(SchemaRuleRuntime, definitions.len);
+        errdefer allocator.free(buffer);
+
+        for (definitions, 0..) |definition, idx| {
+            switch (definition) {
+                .minLength => |rule| {
+                    const message = try makeSchemaMessage(allocator, rule.message, SCHEMA_DEFAULT_MIN_MESSAGE);
+                    buffer[idx] = .{ .min_length = .{
+                        .min = rule.min,
+                        .message = message.value,
+                        .owns_message = message.owns,
+                    } };
+                },
+                .maxLength => |rule| {
+                    const message = try makeSchemaMessage(allocator, rule.message, SCHEMA_DEFAULT_MAX_MESSAGE);
+                    buffer[idx] = .{ .max_length = .{
+                        .max = rule.max,
+                        .message = message.value,
+                        .owns_message = message.owns,
+                    } };
+                },
+                .email => |rule| {
+                    const message = try makeSchemaMessage(allocator, rule.message, SCHEMA_DEFAULT_EMAIL_MESSAGE);
+                    buffer[idx] = .{ .email = .{
+                        .message = message.value,
+                        .owns_message = message.owns,
+                    } };
+                },
+                .custom => |rule| {
+                    buffer[idx] = .{ .custom = rule };
+                },
+            }
+        }
+
+        return .{ .rules = buffer };
+    }
+
+    fn deinit(self: *SchemaFieldRules, allocator: std.mem.Allocator) void {
+        for (self.rules) |*entry| {
+            switch (entry.*) {
+                .min_length => |payload| {
+                    releaseSchemaMessage(allocator, .{ .value = payload.message, .owns = payload.owns_message });
+                },
+                .max_length => |payload| {
+                    releaseSchemaMessage(allocator, .{ .value = payload.message, .owns = payload.owns_message });
+                },
+                .email => |payload| {
+                    releaseSchemaMessage(allocator, .{ .value = payload.message, .owns = payload.owns_message });
+                },
+                .custom => |payload| {
+                    if (payload.deinitContext) |deinit_fn| {
+                        deinit_fn(allocator, payload.context);
+                    }
+                },
+            }
+        }
+
+        if (self.rules.len > 0) {
+            allocator.free(self.rules);
+        }
+        self.rules = &.{};
+    }
+};
+
+const SchemaContext = struct {
+    allocator: std.mem.Allocator,
+    rules: std.StringHashMap(SchemaFieldRules),
+
+    fn init(allocator: std.mem.Allocator, config: SchemaValidationConfig) !*@This() {
+        const ctx = try allocator.create(SchemaContext);
+        errdefer allocator.destroy(ctx);
+
+        ctx.* = .{
+            .allocator = allocator,
+            .rules = std.StringHashMap(SchemaFieldRules).init(allocator),
+        };
+
+        errdefer ctx.rules.deinit();
+
+        for (config.fields) |field_config| {
+            const key = try allocator.dupe(u8, field_config.field);
+            var key_cleanup = true;
+            defer if (key_cleanup) allocator.free(key);
+
+            var field_rules = try SchemaFieldRules.init(allocator, field_config.rules);
+            var rules_cleanup = true;
+            defer if (rules_cleanup) field_rules.deinit(allocator);
+
+            const gop = try ctx.rules.getOrPut(key);
+            if (gop.found_existing) {
+                allocator.free(key);
+                return error.DuplicateSchemaField;
+            }
+
+            gop.key_ptr.* = key;
+            key_cleanup = false;
+            gop.value_ptr.* = field_rules;
+            rules_cleanup = false;
+        }
+
+        return ctx;
+    }
+
+    fn destroy(self: *@This()) void {
+        var it = self.rules.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.deinit(self.allocator);
+            self.allocator.free(@constCast(entry.key_ptr.*));
+        }
+        self.rules.deinit();
+        self.allocator.destroy(self);
+    }
+
+    fn validate(
+        self: *@This(),
+        field: []const u8,
+        value: []const u8,
+        allocator: std.mem.Allocator,
+    ) anyerror!ValidationResult {
+        if (self.rules.get(field)) |field_rules| {
+            for (field_rules.rules) |entry| {
+                switch (entry) {
+                    .min_length => |payload| {
+                        if (value.len < payload.min) {
+                            return ValidationResult{ .immediate = .{
+                                .valid = false,
+                                .message = if (payload.message.len == 0) null else payload.message,
+                            } };
+                        }
+                    },
+                    .max_length => |payload| {
+                        if (value.len > payload.max) {
+                            return ValidationResult{ .immediate = .{
+                                .valid = false,
+                                .message = if (payload.message.len == 0) null else payload.message,
+                            } };
+                        }
+                    },
+                    .email => |payload| {
+                        if (!isValidEmail(value)) {
+                            return ValidationResult{ .immediate = .{
+                                .valid = false,
+                                .message = if (payload.message.len == 0) null else payload.message,
+                            } };
+                        }
+                    },
+                    .custom => |payload| {
+                        const result = try payload.validate(field, value, allocator, payload.context);
+                        switch (result) {
+                            .immediate => |outcome| {
+                                if (!outcome.valid) {
+                                    return ValidationResult{ .immediate = outcome };
+                                }
+                            },
+                            .future => return result,
+                        }
+                    },
+                }
+            }
+        }
+
+        return ValidationResult{ .immediate = ValidationOutcome{} };
+    }
+};
+
+fn createSchemaValidationAdapter(allocator: std.mem.Allocator, config: SchemaValidationConfig) !ValidationAdapter {
+    const ctx = try SchemaContext.init(allocator, config);
+    var ctx_cleanup = true;
+    defer if (ctx_cleanup) ctx.destroy();
+
+    const validateFn = struct {
+        fn run(field: []const u8, value: []const u8, alloc: std.mem.Allocator, ctx_ptr: ?*anyopaque) anyerror!ValidationResult {
+            const context = @as(*SchemaContext, @ptrFromInt(@intFromPtr(ctx_ptr.?)));
+            return context.validate(field, value, alloc);
+        }
+    }.run;
+
+    const deinitFn = struct {
+        fn run(_allocator: std.mem.Allocator, ctx_ptr: ?*anyopaque) void {
+            _ = _allocator;
+            if (ctx_ptr) |ptr| {
+                const context = @as(*SchemaContext, @ptrFromInt(@intFromPtr(ptr)));
+                context.destroy();
+            }
+        }
+    }.run;
+
+    ctx_cleanup = false;
+    return ValidationAdapter{
+        .validateField = validateFn,
+        .deinitContext = deinitFn,
+        .context = ctx,
+    };
+}
+
+const MatchFieldContext = struct {
+    allocator: std.mem.Allocator,
+    other_field: []u8,
+    message: []const u8,
+    owns_message: bool,
+
+    fn create(allocator: std.mem.Allocator, rule: SchemaMatchFieldRule) !*@This() {
+        const ctx = try allocator.create(MatchFieldContext);
+        errdefer allocator.destroy(ctx);
+
+        const other_copy = try allocator.dupe(u8, rule.other_field);
+        var other_cleanup = true;
+        defer if (other_cleanup) allocator.free(other_copy);
+
+        const message = try makeSchemaMessage(allocator, rule.message, SCHEMA_DEFAULT_MATCH_MESSAGE);
+        var message_cleanup = message.owns;
+        defer if (message_cleanup and message.value.len > 0) allocator.free(@constCast(message.value));
+
+        ctx.* = .{
+            .allocator = allocator,
+            .other_field = other_copy,
+            .message = message.value,
+            .owns_message = message.owns,
+        };
+
+        other_cleanup = false;
+        message_cleanup = false;
+        return ctx;
+    }
+
+    fn destroy(self: *@This()) void {
+        self.allocator.free(self.other_field);
+        if (self.owns_message and self.message.len > 0) {
+            self.allocator.free(@constCast(self.message));
+        }
+        self.allocator.destroy(self);
+    }
+};
+
+fn matchFieldValidate(store: *FormStore, target: []const u8, ctx_ptr: ?*anyopaque) anyerror!ValidationOutcome {
+    const ctx = @as(*MatchFieldContext, @ptrFromInt(@intFromPtr(ctx_ptr.?)));
+    const target_value = store.fieldValue(target) orelse &[_]u8{};
+    const other_value = store.fieldValue(ctx.other_field) orelse &[_]u8{};
+    if (std.mem.eql(u8, target_value, other_value)) {
+        return ValidationOutcome{};
+    }
+    return ValidationOutcome{
+        .valid = false,
+        .message = if (ctx.message.len == 0) null else ctx.message,
+    };
+}
+
+fn matchFieldDeinit(_allocator: std.mem.Allocator, ctx_ptr: ?*anyopaque) void {
+    _ = _allocator;
+    if (ctx_ptr) |ptr| {
+        const ctx = @as(*MatchFieldContext, @ptrFromInt(@intFromPtr(ptr)));
+        ctx.destroy();
+    }
+}
+
+fn installSchemaCrossFieldRules(
+    allocator: std.mem.Allocator,
+    store: *FormStore,
+    rules: []const SchemaCrossFieldRule,
+) !void {
+    for (rules) |rule| {
+        switch (rule) {
+            .matchField => |config| {
+                const ctx = try MatchFieldContext.create(allocator, config);
+                var ctx_cleanup = true;
+                defer if (ctx_cleanup) ctx.destroy();
+
+                const deps = [_][]const u8{ ctx.other_field };
+                try store.registerCrossFieldValidation(.{
+                    .field = config.field,
+                    .dependencies = &deps,
+                    .validate = matchFieldValidate,
+                    .context = @as(?*anyopaque, @ptrFromInt(@intFromPtr(ctx))),
+                    .deinitContext = matchFieldDeinit,
+                });
+                ctx_cleanup = false;
+            },
+            .custom => |config| {
+                try store.registerCrossFieldValidation(.{
+                    .field = config.field,
+                    .dependencies = config.dependencies,
+                    .validate = config.validate,
+                    .context = config.context,
+                    .deinitContext = config.deinitContext,
+                });
+            },
+        }
+    }
+}
+
+fn isValidEmail(value: []const u8) bool {
+    if (value.len < 3) return false;
+
+    var at_index: ?usize = null;
+    for (value, 0..) |char, idx| {
+        if (char == '@') {
+            if (at_index != null) return false;
+            at_index = idx;
+        } else if (char <= 32 or char == '\\') {
+            return false;
+        }
+    }
+
+    const at = at_index orelse return false;
+    if (at == 0 or at == value.len - 1) return false;
+
+    const domain = value[at + 1 ..];
+    if (domain.len < 3) return false;
+    if (domain[domain.len - 1] == '.') return false;
+    return std.mem.indexOfScalar(u8, domain, '.') != null;
+}
+
 const FieldContext = struct {
     store: *FormStore,
     field_name: []const u8,
@@ -955,6 +1642,10 @@ const FieldContext = struct {
 
 const CheckboxMemoContext = struct {
     value: core.ReadSignal([]const u8),
+};
+
+const AriaInvalidMemoContext = struct {
+    valid: core.ReadSignal(bool),
 };
 
 const FormSubmitContext = struct {
@@ -1066,6 +1757,12 @@ fn computeCheckedAttr(_: *core.EffectContext, user_data: ?*anyopaque) anyerror![
     return EMPTY_ATTR;
 }
 
+fn computeAriaInvalid(_: *core.EffectContext, user_data: ?*anyopaque) anyerror![]const u8 {
+    const ctx = @as(*AriaInvalidMemoContext, @ptrFromInt(@intFromPtr(user_data.?)));
+    const is_valid = try ctx.valid.get();
+    return if (is_valid) FALSE_STR else TRUE_STR;
+}
+
 pub const TextBinding = struct {
     field: FieldView,
     on_input: component.View.EventHandler,
@@ -1175,6 +1872,32 @@ pub fn bindCheckbox(allocator: std.mem.Allocator, store: *FormStore, name: []con
         .context = ctx,
         .memo = memo,
         .memo_ctx = memo_ctx,
+    };
+}
+
+pub const AriaInvalidBinding = struct {
+    value: core.ReadSignal([]const u8),
+    memo: core.MemoHandle([]const u8),
+    allocator: std.mem.Allocator,
+    context: *AriaInvalidMemoContext,
+
+    pub fn deinit(self: *@This()) void {
+        self.memo.dispose();
+        self.allocator.destroy(self.context);
+        self.context = undefined;
+    }
+};
+
+pub fn bindAriaInvalid(allocator: std.mem.Allocator, field: FieldView) !AriaInvalidBinding {
+    const ctx = try allocator.create(AriaInvalidMemoContext);
+    ctx.* = .{ .valid = field.valid };
+    const memo = try core.createMemo([]const u8, allocator, computeAriaInvalid, ctx);
+
+    return AriaInvalidBinding{
+        .value = memo.read,
+        .memo = memo,
+        .allocator = allocator,
+        .context = ctx,
     };
 }
 
@@ -1878,6 +2601,231 @@ test "validation throttler limits validation frequency" {
     try testing.expectEqual(@as(usize, 3), ctx.count);
 
     throttler.cancel();
+}
+
+test "cross-field validation enforces confirm password" {
+    const MatchContext = struct {
+        fn validate(store: *FormStore, _: []const u8, _: ?*anyopaque) anyerror!ValidationOutcome {
+            const password = store.fieldValue("password") orelse return ValidationOutcome{};
+            const confirm = store.fieldValue("confirm") orelse return ValidationOutcome{};
+            if (password.len == 0 and confirm.len == 0) return ValidationOutcome{};
+            if (!std.mem.eql(u8, password, confirm)) {
+                return ValidationOutcome{ .valid = false, .message = "Passwords do not match" };
+            }
+            return ValidationOutcome{};
+        }
+    };
+
+    var store = try FormStore.init(testing.allocator, .{});
+    defer store.deinit();
+
+    try store.registerField(.{ .name = "password", .initial = "" });
+    try store.registerField(.{ .name = "confirm", .initial = "" });
+
+    try store.registerCrossFieldValidation(.{
+        .field = "confirm",
+        .dependencies = &.{ "password" },
+        .validate = MatchContext.validate,
+    });
+
+    const confirm_view = store.fieldView("confirm") orelse return error.TestUnexpectedResult;
+    try expectBoolSignal(confirm_view.valid, true);
+    try expectStringSignal(confirm_view.error_message, "");
+
+    try store.setValue("password", "secret");
+    try store.setValue("confirm", "secret");
+    try expectBoolSignal(confirm_view.valid, true);
+    try expectStringSignal(confirm_view.error_message, "");
+
+    try store.setValue("password", "changed");
+    try expectBoolSignal(confirm_view.valid, false);
+    try expectStringSignal(confirm_view.error_message, "Passwords do not match");
+
+    try store.setValue("confirm", "changed");
+    try expectBoolSignal(confirm_view.valid, true);
+    try expectStringSignal(confirm_view.error_message, "");
+}
+
+test "schema adapter enforces rules and accessibility helpers" {
+    const schema = SchemaValidationConfig{
+        .fields = &.{
+            .{
+                .field = "email",
+                .rules = &.{ SchemaRule{ .email = .{ .message = "Invalid email" } } },
+            },
+            .{
+                .field = "password",
+                .rules = &.{
+                    SchemaRule{ .minLength = .{ .min = 4, .message = "Too short" } },
+                    SchemaRule{ .maxLength = .{ .max = 8, .message = "Too long" } },
+                },
+            },
+            .{ .field = "confirm", .rules = &.{} },
+        },
+        .cross_fields = &.{
+            SchemaCrossFieldRule{ .matchField = .{ .field = "confirm", .other_field = "password", .message = "Passwords mismatch" } },
+        },
+    };
+
+    var store = try FormStore.init(testing.allocator, .{ .schema = schema });
+    defer store.deinit();
+
+    try store.registerField(.{ .name = "email", .initial = "user@example.com" });
+    try store.registerField(.{ .name = "password", .initial = "abcd" });
+    try store.registerField(.{ .name = "confirm", .initial = "abcd" });
+
+    const email_view = store.fieldView("email") orelse return error.TestUnexpectedResult;
+    const password_view = store.fieldView("password") orelse return error.TestUnexpectedResult;
+    const confirm_view = store.fieldView("confirm") orelse return error.TestUnexpectedResult;
+
+    var aria_binding = try bindAriaInvalid(testing.allocator, email_view);
+    defer aria_binding.deinit();
+
+    try store.setValue("email", "invalid");
+    try expectBoolSignal(email_view.valid, false);
+    try expectStringSignal(email_view.error_message, "Invalid email");
+    try expectStringSignal(aria_binding.value, TRUE_STR);
+    const first_invalid = store.firstInvalidFieldName() orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.eql(u8, first_invalid, "email"));
+
+    const FocusCtx = struct {
+        value: ?[]const u8 = null,
+    };
+    var focus_ctx = FocusCtx{};
+    const focus_ptr = @as(?*anyopaque, @ptrFromInt(@intFromPtr(&focus_ctx)));
+    const FocusFn = struct {
+        fn run(name: []const u8, ctx_ptr: ?*anyopaque) anyerror!void {
+            const ctx = @as(*FocusCtx, @ptrFromInt(@intFromPtr(ctx_ptr.?)));
+            ctx.value = name;
+        }
+    };
+    const did_focus = try store.focusFirstInvalidField(FocusFn.run, focus_ptr);
+    try testing.expect(did_focus);
+    try testing.expect(focus_ctx.value != null);
+    try testing.expect(std.mem.eql(u8, focus_ctx.value.?, "email"));
+
+    try store.setValue("password", "abc");
+    try expectBoolSignal(password_view.valid, false);
+    try expectStringSignal(password_view.error_message, "Too short");
+
+    try store.setValue("password", "toolongv" ++ "alue");
+    try expectBoolSignal(password_view.valid, false);
+    try expectStringSignal(password_view.error_message, "Too long");
+
+    try store.setValue("password", "secret");
+    try expectBoolSignal(password_view.valid, true);
+
+    try expectBoolSignal(confirm_view.valid, false);
+    try expectStringSignal(confirm_view.error_message, "Passwords mismatch");
+
+    var summary = try store.collectErrorSummary(testing.allocator);
+    defer summary.deinit();
+    try testing.expectEqual(@as(usize, 2), summary.len());
+    const items = summary.values();
+    try testing.expect(std.mem.eql(u8, items[0].field, "email"));
+    try testing.expect(std.mem.eql(u8, items[1].field, "confirm"));
+
+    const summary_view = try store.buildErrorSummaryView(testing.allocator, "Please fix the errors");
+    switch (summary_view) {
+        .element => |elem| {
+            try testing.expect(std.mem.eql(u8, elem.tag, "div"));
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    try store.setValue("email", "user@example.com");
+    try store.setValue("confirm", "secret");
+    try expectBoolSignal(email_view.valid, true);
+    try expectBoolSignal(confirm_view.valid, true);
+    try expectStringSignal(aria_binding.value, FALSE_STR);
+
+    const did_focus_after = try store.focusFirstInvalidField(FocusFn.run, focus_ptr);
+    try testing.expect(!did_focus_after);
+}
+
+test "schema adapter supports async custom rules" {
+    const AsyncRule = struct {
+        allocator: std.mem.Allocator,
+        futures: std.ArrayList(*zsync.Future(ValidationOutcome)),
+
+        fn create(allocator: std.mem.Allocator) !*@This() {
+            const ctx = try allocator.create(@This());
+            errdefer allocator.destroy(ctx);
+            ctx.* = .{
+                .allocator = allocator,
+                .futures = std.ArrayList(*zsync.Future(ValidationOutcome)).init(allocator),
+            };
+            return ctx;
+        }
+
+        fn destroy(self: *@This()) void {
+            for (self.futures.items) |future| {
+                future.cancel();
+                future.deinit();
+            }
+            self.futures.deinit();
+            self.allocator.destroy(self);
+        }
+
+        fn validate(_: []const u8, _: []const u8, _: std.mem.Allocator, ctx_ptr: ?*anyopaque) anyerror!ValidationResult {
+            const ctx = @as(*@This(), @ptrFromInt(@intFromPtr(ctx_ptr.?)));
+            if (ctx.futures.popOrNull()) |future| {
+                return ValidationResult{ .future = AsyncValidation{ .future = future } };
+            }
+            return ValidationResult{ .immediate = ValidationOutcome{} };
+        }
+
+        fn deinitContext(_: std.mem.Allocator, ctx_ptr: ?*anyopaque) void {
+            if (ctx_ptr) |ptr| {
+                const ctx = @as(*@This(), @ptrFromInt(@intFromPtr(ptr)));
+                ctx.destroy();
+            }
+        }
+    };
+
+    var ctx = try AsyncRule.create(testing.allocator);
+    var ctx_cleanup = true;
+    defer if (ctx_cleanup) ctx.destroy();
+
+    const schema = SchemaValidationConfig{
+        .fields = &.{
+            .{
+                .field = "username",
+                .rules = &.{ SchemaRule{ .custom = .{ .validate = AsyncRule.validate, .context = ctx, .deinitContext = AsyncRule.deinitContext } } },
+            },
+        },
+    };
+
+    var store = try FormStore.init(testing.allocator, .{ .schema = schema });
+    defer store.deinit();
+    ctx_cleanup = false;
+
+    try store.registerField(.{ .name = "username", .initial = "" });
+    const view = store.fieldView("username") orelse return error.TestUnexpectedResult;
+
+    const first_future = try zsync.Future(ValidationOutcome).init(testing.allocator);
+    try ctx.futures.append(first_future);
+
+    try store.setValue("username", "first");
+    try expectBoolSignal(store.validatingSignal(), true);
+    try expectBoolSignal(view.validating, true);
+
+    first_future.resolve(.{ .valid = false, .message = "Taken" });
+    try store.tickAsyncValidations();
+    try expectBoolSignal(view.valid, false);
+    try expectStringSignal(view.error_message, "Taken");
+
+    const second_future = try zsync.Future(ValidationOutcome).init(testing.allocator);
+    try ctx.futures.append(second_future);
+
+    try store.setValue("username", "available");
+    try expectBoolSignal(store.validatingSignal(), true);
+    try expectBoolSignal(view.validating, true);
+
+    second_future.resolve(.{ .valid = true, .message = null });
+    try store.tickAsyncValidations();
+    try expectBoolSignal(view.valid, true);
+    try expectStringSignal(view.error_message, "");
 }
 
 test "form submit binding prevents default when invalid" {

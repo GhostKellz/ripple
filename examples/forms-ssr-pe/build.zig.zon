@@ -1,0 +1,19 @@
+.{
+    .name = .forms_ssr_pe,
+    .version = "0.1.0",
+    .fingerprint = 0x50b159c9e1070079,
+    .dependencies = .{
+        .ripple = .{ .path = "../.." },
+        .zsync = .{
+            .url = "https://github.com/ghostkellz/zsync/archive/main.tar.gz",
+            .hash = "zsync-0.7.1-KAuhef8qIQApcisOPygXIeE9pC8qzdQL2Jp96JbNQyRm",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "public",
+        "README.md",
+    },
+}

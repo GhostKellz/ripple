@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Ripple Forms SSR + Progressive Enhancement</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+  </head>
+  <body>
+    <h1>Account Registration</h1>
+    <div class="form-error-summary" role="alert" aria-live="polite" tabindex="-1">
+      <h2>Please fix the highlighted fields</h2>
+      <ul class="form-error-summary__list">
+        <li data-field="email">email: Enter a valid email</li>
+        <li data-field="password">password: Password too short</li>
+        <li data-field="confirm">confirm: Passwords must match</li>
+      </ul>
+    </div>
+
+    <form id="registration" data-ripple-form>
+      <label>
+        Email
+        <input id="email" name="email" value="invalid" aria-invalid="true" />
+      </label>
+
+      <label>
+        Password
+        <input id="password" name="password" type="password" value="123" aria-invalid="true" />
+      </label>
+
+      <label>
+        Confirm Password
+        <input id="confirm" name="confirm" type="password" value="456" aria-invalid="true" />
+      </label>
+
+      <label>
+        Username
+        <input id="username" name="username" value="taken" aria-invalid="true" data-validating="true" />
+      </label>
+
+      <button type="submit">Create account</button>
+    </form>
+
+    <script type="module">
+      import initWasm from "./forms-ssr-pe.js";
+      initWasm();
+    </script>
+  </body>
+</html>

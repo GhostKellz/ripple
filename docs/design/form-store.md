@@ -37,7 +37,7 @@ const password_error = try password.error_message.get();
 ```
 
 ### Types
-- `FormStoreOptions` — `.{ .validation = ?ValidationAdapter }` allowing callers to inject schema adapters.
+- `FormStoreOptions` — `.{ .validation = ?ValidationAdapter, .schema = ?SchemaValidationConfig }` allowing callers to inject hand-rolled adapters or declarative schemas.
 - `FieldConfig` — `{ name: []const u8, initial: []const u8 }` remains unchanged.
 - `FieldView` — stable reference exposing read signals for `value`, `dirty`, `touched`, `validating`, `valid`, and `error_message` plus the initial value.
 - `FormSnapshot` — `{ dirty: bool, touched: bool, validating: bool, valid: bool }` convenience struct mirroring aggregate signals.
@@ -46,13 +46,21 @@ const password_error = try password.error_message.get();
 - `ValidationResult` — union between immediate `ValidationOutcome` responses and async futures for deferred checks.
 - `AsyncValidation` — wrapper around `zsync.Future(ValidationOutcome)` used to represent in-flight checks.
 - `ValidationBatchGuard` — RAII helper returned by `FormStore.beginValidationBatch()` to coalesce repeated validations within a critical section.
+- `CrossFieldValidationConfig` — payload consumed by `registerCrossFieldValidation()` for dependent validation rules (e.g., password confirmation).
 - `ValidationDebouncer` — controller that postpones validation flushes until a configurable delay elapses.
 - `ValidationThrottler` — controller that enforces a minimum interval between validation flushes.
 - `ZSchemaMinLengthRule` — helper rule used by the bundled min-length adapter prototype.
+- `SchemaValidationConfig` — declarative schema object consumed via `FormStoreOptions.schema`.
+- `SchemaRule` / `SchemaCustomRule` — per-field rule variants spanning min/max length, email, and custom sync/async validators.
+- `SchemaCrossFieldRule` / `SchemaMatchFieldRule` — declarative dependent-field wiring with escape hatches for custom callbacks.
+- `ErrorSummary` / `ErrorSummaryItem` — disposable containers returned by `collectErrorSummary()`.
+- `AriaInvalidBinding` — memoised helper that exposes a dynamic `aria-invalid` signal for any `FieldView`.
 
 ### Errors
 - `error.DuplicateField`
 - `error.UnknownField`
+- `error.ConflictingValidationAdapters`
+- `error.DuplicateSchemaField`
 
 ## State Management
 - Internally use `std.StringHashMap(FieldState)` keyed by field name.
@@ -68,6 +76,7 @@ const password_error = try password.error_message.get();
 - `beginValidationBatch()` defers adapter invocations until the guard completes, coalescing multiple value writes into a single validation pass per field.
 - `withValidationBatch()` offers a convenience wrapper around the guard for callers who prefer higher-order helpers over manual RAII.
 - Debounce/throttle controllers expose `touch()`/`tick()` methods so hosts can wire in their own scheduling primitives while still benefiting from batched validation.
+- `registerCrossFieldValidation()` wires dependent validators; use `fieldValue()` or `fieldView()` inside callbacks to inspect sibling state.
 
 ## Validation Adapters
 - `ValidationAdapter` wraps schema engines behind a shared interface that receives `(field, value, allocator, context)` and returns a `ValidationResult`.
@@ -75,6 +84,20 @@ const password_error = try password.error_message.get();
 - When a new async validation is scheduled for the same field, the previous future is cancelled, a `"Validation cancelled"` message is surfaced, and the store keeps the field in a validating state until the replacement future resolves.
 - Validation batches let callers delay adapter invocations across a critical section, ensuring only the latest value for each field is validated when the guard completes.
 - Debounce and throttle controllers build on batching, trading immediate validation for time-based coalescing. Both rely on periodic `tick()` calls (e.g., from an event loop) to flush pending guards once their timers expire.
+- Cross-field callbacks run whenever dependent fields change, enabling combined error messages without reimplementing adapter logic.
+
+### Schema Validation
+- Provide `FormStoreOptions.schema = SchemaValidationConfig{ ... }` to install built-in rules without hand-written adapters.
+- Built-in `SchemaRule` variants span `minLength`, `maxLength`, and `email` validators; omit the `message` to fall back to house copy or override per rule.
+- `SchemaRule.custom` accepts sync or async callbacks returning `ValidationResult`, making it easy to wrap existing server-side checks.
+- Cross-field dependencies register automatically via `SchemaCrossFieldRule.matchField` or `.custom`, sharing the same trigger semantics as manual registrations.
+- Supplying both `.validation` and `.schema` rejects with `error.ConflictingValidationAdapters`, and declaring the same field twice yields `error.DuplicateSchemaField`.
+
+### Accessibility Helpers
+- `collectErrorSummary()` preserves registration order and duplicates field names/messages so summaries can be rendered and freed safely.
+- `buildErrorSummaryView()` emits a `<div role="alert" aria-live="polite" tabindex="-1">` block with a heading and `<ul>` of human-readable errors.
+- `firstInvalidFieldName()` / `focusFirstInvalidField()` assist in focusing the earliest invalid control during progressive enhancement flows.
+- `bindAriaInvalid()` derives a memoised `aria-invalid` attribute linked to a field's `valid` signal, avoiding manual string toggles.
 
 ## Progressive Enhancement
 - `bindFormSubmit` wires native `<form>` submit events to the store. It marks all fields as touched, re-runs validation, and (by default) prevents submission when the form is invalid.

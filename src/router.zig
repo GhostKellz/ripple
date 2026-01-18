@@ -246,7 +246,7 @@ pub const Router = struct {
                 if (std.mem.eql(u8, target, path)) return;
                 return self.navigate(target);
             },
-            .reject => |_| {
+            .reject => {
                 if (pending_match) |*match| match.deinit();
             },
         }
